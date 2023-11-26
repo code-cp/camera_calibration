@@ -1,6 +1,3 @@
-use core::num;
-
-use argmin::prelude::*; 
 use nalgebra as na; 
 
 fn skew(v: na::Vector3<f64>) -> na::Matrix3<f64> {
@@ -162,20 +159,9 @@ impl<'a> Calibration<'a> {
 
 /// Must implement apply function for residual 
 /// and jacobian function 
-impl ArgminOp for Calibration<'_> {
-    /// type of param vec
-    type Param = na::DVector<f64>;
-    /// type of residual 
-    type Output = na::DVector<f64>; 
-    /// type of Hessian 
-    type Hessian = (); 
-    /// type of jacobian 
-    type Jacobian = na::DMatrix<f64>; 
-    /// floating point precision 
-    type Float = f64; 
-
+impl Calibration<'_> {
     /// Calculate residual 
-    fn apply(&self, p: &Self::Param) -> Result<Self::Output, Error> {
+    fn apply(&self, p: &na::DVector<f64>) -> na::DVector<f64> {
         let (camera_model, transforms) = self.decode_params(p); 
 
         let num_images = self.image_pts_set.len(); 
@@ -200,10 +186,10 @@ impl ArgminOp for Calibration<'_> {
             }
         }
 
-        Ok(residual)
+        residual
     }
 
-    fn jacobian(&self, p: &Self::Param) -> Result<Self::Jacobian, Error> {
+    fn jacobian(&self, p: &na::DVector<f64>) -> na::DMatrix<f64> {
         let (camera_model, transforms) = self.decode_params(p); 
 
         let num_images = self.image_pts_set.len();
@@ -234,7 +220,34 @@ impl ArgminOp for Calibration<'_> {
             }
         }
 
-        Ok(jacobian)
+        jacobian
+    }
+
+    /// slam book sec. 5.2.2
+    fn gauss_newton(&self, params: &na::DVector<f64>, max_iter: usize, tolerance: f64) -> na::DVector<f64> {
+        // params size is mx1 
+        let mut params = params.clone(); 
+
+        for _ in 0..max_iter {
+            // residual size is 2n x 1 
+            let residual = self.apply(&params);
+            // jacobian size is 2n x m 
+            let jacobian = self.jacobian(&params);
+
+            // Solve the normal equations: J^T * J * delta_params = J^T * residual
+            let delta_params = na::linalg::SVD::new(&jacobian.transpose() * &jacobian, true, true)
+                .solve(&(&jacobian.transpose() * &residual), tolerance)
+                .unwrap_or(na::DVector::zeros(params.len()));
+
+            params -= delta_params.clone();
+
+            // Check for convergence
+            if delta_params.norm() < tolerance {
+                break;
+            }
+        }
+
+        params
     }
 }
 
@@ -285,7 +298,7 @@ fn main() {
         .collect::<Vec<_>>(); 
 
     // create calibration data 
-    let cal_cost = Calibration {
+    let calibration_solver = Calibration {
         model_pts: &source_pts, 
         image_pts_set: &imaged_pts, 
     };
@@ -294,10 +307,10 @@ fn main() {
     let mut init_param = na::DVector::<f64>::zeros(4+imaged_pts.len()*6); 
 
     // Arbitrary guess for camera model
-    init_param[0] = 1000.0; // fx
-    init_param[1] = 1000.0; // fy
-    init_param[2] = 500.0; // cx
-    init_param[3] = 500.0; // cy
+    init_param[0] = 510.0; // fx
+    init_param[1] = 510.0; // fy
+    init_param[2] = 300.0; // cx
+    init_param[3] = 200.0; // cy
 
     // Arbitrary guess for poses (3m in front of the camera with no rotation)
     // We have to convert this to a 6D lie algebra element to populate the parameter
@@ -315,16 +328,10 @@ fn main() {
         .copy_from(&init_pose_lie);
 
     // Solve with Gauss Newton
-    let solver = argmin::solver::gaussnewton::GaussNewton::new()
-        .with_gamma(1e-1) /* smaller step size to ensure convergence */
-        .unwrap();
-
-    // Run with up to 2000 iterations, printing progress to terminal
-    let res = Executor::new(cal_cost, solver, init_param)
-        .add_observer(ArgminSlogLogger::term(), ObserverMode::Always)
-        .max_iters(2000)
-        .run()
-        .unwrap();
+    let max_iter = 100;
+    // let max_iter = 10;
+    let tolerance = 1e-6;
+    let res: na::Matrix<f64, na::Dynamic, na::Const<1>, na::VecStorage<f64, na::Dynamic, na::Const<1>>> = calibration_solver.gauss_newton(&init_param, max_iter, tolerance);
 
     eprintln!("{}\n\n", res);
 
@@ -332,7 +339,7 @@ fn main() {
     eprintln!("ground truth intrinsics: {}", camera_model);
     eprintln!(
         "optimized intrinsics: {}",
-        res.state().best_param.fixed_slice::<4, 1>(0, 0)
+        res.fixed_slice::<4, 1>(0, 0)
     );
 
     // Print transforms
@@ -342,9 +349,7 @@ fn main() {
             "optimized result[{}]: {}\n",
             i,
             exp_map(
-                &res.state()
-                    .best_param
-                    .fixed_slice::<6, 1>(4 + 6 * i, 0)
+                &res.fixed_slice::<6, 1>(4 + 6 * i, 0)
                     .clone_owned()
             )
         );
