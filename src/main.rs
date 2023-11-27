@@ -88,6 +88,7 @@ fn project(
     na::Point2::<f64>::new(
         // fx*x / z + cx
         params[0] * pt.x / pt.z + params[2],
+        // fy*y / z + cy
         params[1] * pt.y / pt.z + params[3],  
     )
 }
@@ -328,8 +329,6 @@ fn main() {
     let max_iter = 100;
     let tolerance = 1e-6;
     let res: na::Matrix<f64, na::Dynamic, na::Const<1>, na::VecStorage<f64, na::Dynamic, na::Const<1>>> = calibration_solver.gauss_newton(&init_param, max_iter, tolerance);
-
-    eprintln!("{}\n\n", res);
 
     // Print intrinsics results
     eprintln!("ground truth intrinsics: {}", camera_model);
