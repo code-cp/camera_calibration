@@ -1,5 +1,6 @@
 use nalgebra as na; 
 
+/// slam book eq. 2.4 
 fn skew(v: na::Vector3<f64>) -> na::Matrix3<f64> {
     let mut ss = na::Matrix3::zeros();
     ss[(0, 1)] = -v[2];
@@ -11,63 +12,57 @@ fn skew(v: na::Vector3<f64>) -> na::Matrix3<f64> {
     ss
 }
 
-/// Sec. 9.4.2.1 in https://ingmec.ual.es/~jlblanco/papers/jlblanco2010geometry3D_techrep.pdf
-fn exp_map(v: &na::Vector6<f64>) -> na::Isometry3<f64> {
-    let t = v.fixed_slice::<3, 1>(0,0); 
-    let omega = v.fixed_slice::<3, 1>(3,0); 
-    
-    // map axis-angle to quaternion 
-    let theta = omega.norm(); 
-    let half_theta = 0.5*theta; 
-    // eq. 9.17c
-    let quat_axis = omega*half_theta.sin()/theta; 
-    let quat = if theta > 1e-6 {
-            na::UnitQuaternion::from_quaternion(
-                na::Quaternion::new(half_theta.cos(), 
-                quat_axis.x, 
-                quat_axis.y,
-                quat_axis.z, 
-            )
-        )
-    } else {
-        na::UnitQuaternion::identity()
-    }; 
-
-    let mut v = na::Matrix3::<f64>::identity(); 
+/// slam book eq. 3.27
+fn calculate_j(theta: f64, n: &na::Vector3<f64>) -> na::Matrix3<f64> {
+    let i3 = na::Matrix3::<f64>::identity(); 
+    // need to check value of theta 
+    // otherwise this function will be super slow 
     if theta > 1e-6 {
-        let omega_skew = skew(omega.clone_owned()); 
-        v += omega_skew * (1.0 - theta.cos()) / theta.powi(2)
-            + (omega_skew * omega_skew) * ((theta - theta.sin()) / theta.powi(3));
+        (theta.sin() / theta) * i3 
+        + (1.0 - theta.sin() / theta) * n * n.transpose() 
+        + (1.0 - theta.cos()) / theta * skew(*n)
+    } else {
+        i3 
     }
-
-    let translation = na::Translation::from(v*t);
-
-    na::Isometry3::from_parts(translation, quat)
 }
 
-/// Converts SE3 to se3 
+/// slam book p. 65 
+fn exp_map(v: &na::Vector6<f64>) -> na::Isometry3<f64> {
+    let rho = v.fixed_slice::<3, 1>(0,0); 
+    let phi = v.fixed_slice::<3, 1>(3,0); 
+    
+    let theta = phi.norm();
+    let n = phi / theta; 
+    let exp_phi_skew = theta.cos() * na::Matrix3::<f64>::identity() 
+        + (1.0 - theta.cos()) * n * n.transpose() 
+        + theta.sin() * skew(n);  
+
+    let j = calculate_j(theta, &n);   
+
+    let t = na::Translation3::from(j * rho); 
+    let r = na::Rotation3::from_matrix(&exp_phi_skew); 
+    na::Isometry3::from_parts(t, r.into())
+}
+
+/// Converts SE3 to se3
+/// slam book p. 65 
 fn log_map(v: &na::Isometry3<f64>) -> na::Vector6<f64> {
     let t: na::Vector3<f64> = v.translation.vector;
-
     let quat = v.rotation; 
-    // eq. 9.25c
-    let theta: f64 = 2.0 * (quat.scalar()).acos(); 
-    let half_theta = 0.5 * theta; 
-    let mut omega = na::Vector3::<f64>::zeros(); 
 
-    let mut v_inv = na::Matrix3::<f64>::identity();
-    if theta > 1e-6 {
-        // slam book eq. 2.44 
-        omega = quat.vector() * theta / half_theta.sin();
-        let omega_skew = skew(omega); 
-        // eq. 9.34 
-        v_inv -= omega_skew * 0.5; 
-        v_inv += omega_skew * omega_skew * (1.0 - half_theta * half_theta.cos() / half_theta.sin()) / (theta * theta); 
-    }
+    // quaternion to angle-axis 
+    // slam book eq. 2.44 
+    let theta: f64 = 2.0 * (quat.scalar()).acos();
+    let n = quat.vector() * theta / ((0.5 * theta).sin() + 1e-6);
+    let phi = theta * n; 
+
+    let j = calculate_j(theta, &n);
+    let j_inv = j.try_inverse().unwrap(); 
+    let rho = j_inv * t; 
 
     let mut ret = na::Vector6::<f64>::zeros(); 
-    ret.fixed_slice_mut::<3,1>(0, 0).copy_from(&(v_inv*t)); 
-    ret.fixed_slice_mut::<3,1>(3, 0).copy_from(&omega); 
+    ret.fixed_slice_mut::<3,1>(0, 0).copy_from(&rho); 
+    ret.fixed_slice_mut::<3,1>(3, 0).copy_from(&phi); 
 
     ret 
 }
@@ -235,6 +230,7 @@ impl Calibration<'_> {
             let jacobian = self.jacobian(&params);
 
             // Solve the normal equations: J^T * J * delta_params = J^T * residual
+            // svd solve Solves the system self * x = b where self is the decomposed matrix and x the unknown.
             let delta_params = na::linalg::SVD::new(&jacobian.transpose() * &jacobian, true, true)
                 .solve(&(&jacobian.transpose() * &residual), tolerance)
                 .unwrap_or(na::DVector::zeros(params.len()));
@@ -307,6 +303,7 @@ fn main() {
     let mut init_param = na::DVector::<f64>::zeros(4+imaged_pts.len()*6); 
 
     // Arbitrary guess for camera model
+    // NOTE, cannot be too far away from gt 
     init_param[0] = 510.0; // fx
     init_param[1] = 510.0; // fy
     init_param[2] = 300.0; // cx
@@ -329,7 +326,6 @@ fn main() {
 
     // Solve with Gauss Newton
     let max_iter = 100;
-    // let max_iter = 10;
     let tolerance = 1e-6;
     let res: na::Matrix<f64, na::Dynamic, na::Const<1>, na::VecStorage<f64, na::Dynamic, na::Const<1>>> = calibration_solver.gauss_newton(&init_param, max_iter, tolerance);
 
